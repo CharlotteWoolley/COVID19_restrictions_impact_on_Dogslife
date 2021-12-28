@@ -1,1 +1,1 @@
-# COVID19_restrictions_impact_on_Dogslife
+# COVID19 restrictions impact on Dogslife
