@@ -1,0 +1,1781 @@
+---
+title: "Analysis of the COVID-19 restrictions impact on Dogslife"
+author: "Charlotte Woolley"
+output: html_document
+Date: "31st of December 2021"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+```
+
+Description: This script performs the statistical analysis for analysis of the associations between COVID-19 restrictions and the lifestyle, routine care, insurance status, illness incidence and veterinary attendance with an illness incidence of Dogslife Labrador Retrievers in England.
+
+*Libraries needed for this analysis*
+
+```{r}
+library(MASS)
+library(knitr)
+library(Rmisc)
+library(broom)
+library(lubridate)
+library(epiR)
+library(ggpubr)
+library(parameters)
+library(sjPlot)
+library(lme4)
+library(pROC)
+library(mgcViz)
+library(mgcv)
+library(gamm4)
+library(Metrics)
+library(grid)
+library(skimr)
+library(gridExtra)
+library(gratia)
+library(forestplot)
+library(tidyverse)
+options(scipen = 999)
+```
+
+*get data needed for analysis*
+```{r}
+qdat <- read_csv("questionnaire_data.csv") 
+illness <- read_csv("illness_data.csv") 
+pets <- read_csv("pets_data.csv") 
+owners <- read_csv("owner_data.csv") 
+
+#Get number and proportion of owners in each country in Dogslife
+with(owners, table(`Country Name`))
+with(owners, table(`Country Name`)) %>% prop.table()*100
+
+#remove dogs that are not included in questionnaire data (dogs that registered to Dogslife but never entered a questionnaire about their dog)
+des_to_keep <- qdat %>%
+  mutate(de_ID = 1:nrow(.)) %>%
+  select(pet_ID, date_of_data_entry, de_ID)
+
+#get dogs in England using postcode data joined to country
+country_dat <- full_join(pets, qdat) %>%
+  select(pet_ID, owner_ID) %>%
+  full_join(owners) %>%
+  distinct() %>%
+  select(pet_ID, owner_ID, country = 'Country Name') %>%
+  filter(country == "England")
+
+english_pet_IDs <- country_dat$pet_ID
+
+#Join illness data to the data selected, keeping only dogs in England
+illness2 <- left_join(des_to_keep, illness) %>%
+  group_by(pet_ID) %>%
+  fill(name, .direction = "downup") %>%
+  ungroup() %>%
+  mutate(pet_ID = as.factor(pet_ID)) %>%
+  filter(pet_ID %in% english_pet_IDs)
+
+
+###Get just the information that is needed by select variables
+qdat2 <- qdat %>%
+    mutate(year = year(date_of_data_entry)) %>%
+  filter(pet_ID %in% english_pet_IDs) %>%
+  mutate(pet_ID = as.factor(pet_ID)) 
+
+pets2 <- pets %>%
+  select(pet_ID, name, pet_registration_date, DOB, sex) %>%
+  mutate(year_pet = year(pet_registration_date)) %>%
+  filter(pet_ID %in% english_pet_IDs) %>%
+  mutate(pet_ID = as.factor(pet_ID))
+
+#How long does it take an owner to report an illness in Dogslife data?
+illness_filt2 <- illness2 %>%
+  mutate(reporting_time = as.numeric(difftime(date_of_data_entry, start_date, units = "days"))) %>%
+  filter(date_of_data_entry < as.Date("2020-08-01"))%>%
+  filter(!is.na(reporting_time))
+CI(illness_filt2$reporting_time, ci = 0.95)
+sd(illness_filt2$reporting_time)
+median(illness_filt2$reporting_time)
+IQR(illness_filt2$reporting_time)
+```
+
+# SUPPLEMENTARY ANALYSIS (ADDITIONAL FILE 2): Investigating the association of COVID-19 restrictions with Dogslife owner reporting frequency.
+
+```{r}
+#Study the data entries plus 19 days (the median days it takes to report a data entry)
+dat2 <- qdat2 %>%
+  mutate(date_no_year = format(date_of_data_entry, "%m-%d"),
+         date_no_year = paste("0000-", date_no_year, sep = ""),
+         date_no_year = as.Date(date_no_year),
+         stop_count = date_no_year == as.Date("0000-07-23")) %>%
+    filter(date_no_year >= as.Date("0000-03-23") &
+           date_no_year <= as.Date("0000-07-23")) %>%
+    filter(date_of_data_entry >= as.Date("2011-02-01") &
+           date_of_data_entry  <= as.Date("2020-08-01"))
+
+#How much data is here
+length(dat2$pet_ID)  
+
+#group questionnaire data into years
+des_period <- dat2 %>%
+  group_by(year) %>%
+  count()  %>%
+  rename(n_des = n) %>%
+  ungroup() 
+
+#group number of registrations into years
+pets_period <- pets2 %>%
+  mutate(date_no_year = format(pet_registration_date, "%m-%d"),
+         date_no_year = paste("0000-", date_no_year, sep = ""),
+         date_no_year = as.Date(date_no_year))%>%
+    filter(date_no_year >= as.Date("0000-03-23") &
+           date_no_year <= as.Date("0000-07-23")) %>%
+    filter(pet_registration_date >= as.Date("2011-02-01") &
+           pet_registration_date  <= as.Date("2020-08-01")) %>%
+  group_by(year_pet) %>%
+  count()  %>%
+  rename(n_pets = n) %>%
+  ungroup() %>%
+  rename(year = year_pet)
+
+joined <- full_join(pets_period, des_period)
+
+#Function to count the number of pets registered in each age group
+count_pets <- function(mid_date){
+  pets2 %>% 
+    filter(pet_registration_date <= mid_date) %>% 
+    mutate(age = as.numeric(mid_date - DOB) / 365) %>% 
+    mutate(over_1_year = if_else(age >= 1, "over_1_year", "under_1_year")) %>% 
+    count(over_1_year) %>% 
+    pivot_wider(names_from = over_1_year, values_from = n)
+}
+
+mid_dates <- c("2011-05-24", "2012-05-24", "2013-05-24", "2014-05-24", "2015-05-24", "2016-05-24","2017-05-24", "2018-05-24", "2019-05-24", "2020-05-24") %>% 
+  ymd() %>% 
+  purrr::set_names()
+
+pet_ages <- map_df(mid_dates, count_pets, .id = "mid_date") %>%
+  mutate(year = year(mid_date),
+         year2020 = year == 2020)
+
+#Join data
+joined <- full_join(pet_ages, joined) 
+
+data_table1 <- joined %>%
+  select(year, n_des, under_1_year, over_1_year) 
+
+data_table1 %>%
+  kable()
+
+#poisson glm
+mod_pois <- glm(n_des ~ over_1_year + under_1_year + year2020, data = joined, family = poisson(link = "log"))
+joined$predictions <- exp(predict(mod_pois))
+rmse(joined$n_des, joined$predictions) 
+AIC(mod_pois) 
+
+#poisson glm with quadratic terms
+mod_glmq_pois <- glm(n_des ~ over_1_year + I(over_1_year^2) + under_1_year + I(under_1_year^2) + year2020, data = joined, family = poisson(link = "log"))
+joined$predictions <- exp(predict(mod_glmq_pois))
+rmse(joined$n_des, joined$predictions)
+AIC(mod_glmq_pois)
+
+#poisson GAM
+modgam_pois <- gam(n_des ~ s(over_1_year, k =5) + s(under_1_year, k =5) + year2020, data = joined, family = poisson(link = "log"))
+
+summary(modgam_pois)
+tab_model(modgam_pois, digits = 4)
+joined$predictions <- exp(predict(modgam_pois))
+joined$residuals <- residuals(modgam_pois)
+rmse(joined$n_des, joined$predictions)
+AIC(modgam_pois)
+gam.check(modgam_pois) #k set to 5 - highest possible with DF
+
+over_1_year_gamplot <- draw(modgam_pois, select = "s(over_1_year)")  +
+  labs(x = "Dogs registered over 1 year", y = "Centred smooth of dogs registered over 1 year", title = "") +
+  scale_y_continuous(limits = c(-0.4, 0.4)) +
+  annotate("text", x=3000, y=0.4, label= "EDF = 3.73", size =4.5, fontface =2) +
+  theme_bw() +
+  theme(axis.title.y = element_text(face="bold", size=14),
+        axis.text.y  = element_text(size=14),
+        axis.title.x = element_text(face="bold", size=14),
+        axis.text.x  = element_text(size=14))
+
+under_1_year_gamplot <- draw(modgam_pois, select = "s(under_1_year)")  +
+  labs(x = "Dogs registered under 1 year", y = "Centred smooth of dogs registered under 1 year", title = "") +
+  scale_y_continuous(limits = c(-0.4, 0.4)) +
+  annotate("text", x=350, y=0.4, label= "EDF = 1.00", size =4.5, fontface =2) +
+  theme_bw() +
+  theme(axis.title.y = element_text(face="bold", size=14),
+        axis.text.y  = element_text(size=14),
+        axis.title.x = element_text(face="bold", size=14),
+        axis.text.x  = element_text(size=14))
+
+tiff("Dog_regs_gam_curves.tiff", units="mm", width=300, height=150, res=300)
+grid.arrange(over_1_year_gamplot, under_1_year_gamplot, ncol=2)
+dev.off()
+
+modgam_QQplot <- ggplot(joined, aes(sample = residuals)) +
+  stat_qq() +
+  stat_qq_line(alpha = 0.3) +
+  labs(x = "Theoretical quantiles", y = "Sample quantiles") +
+  scale_x_continuous(limits = c(-2,2), breaks = c(-2, -1, 0, 1, 2)) +
+  scale_y_continuous(limits = c(-2,2), breaks = c(-2, -1, 0, 1, 2)) +
+  theme_bw() +
+  theme(axis.title.y = element_text(face="bold", size=14),
+        axis.text.y  = element_text(size=14),
+        axis.title.x = element_text(face="bold", size=14),
+        axis.text.x  = element_text(size=14))
+modgam_QQplot
+
+modgam_pva_plot <- ggplot(joined, aes(x = predictions, y = n_des)) +
+  geom_point() +
+  geom_abline(slope = 1, alpha = 0.3) +
+  scale_x_continuous(limits = c(1000, 1700)) +
+  scale_y_continuous(limits = c(1000, 1700)) +
+  labs(x = "Predicted values", y = "Actual values") +
+  theme_bw() +
+  theme(axis.title.y = element_text(face="bold", size=14),
+        axis.text.y  = element_text(size=14),
+        axis.title.x = element_text(face="bold", size=14),
+        axis.text.x  = element_text(size=14))
+modgam_pva_plot
+
+modgam_resid_hist <- ggplot(joined, aes(x = residuals)) +
+  geom_histogram(bins = 10)  +
+  labs(x = "Residuals", y = "Count") +
+  scale_x_continuous(limits = c(-2.5, 2.5)) +
+  theme_bw() +
+  theme(axis.title.y = element_text(face="bold", size=14),
+        axis.text.y  = element_text(size=14),
+        axis.title.x = element_text(face="bold", size=14),
+        axis.text.x  = element_text(size=14))
+modgam_resid_hist
+
+tiff("Dog_regs_mod_checks.tiff", units="mm", width=300, height=100, res=300)
+grid.arrange(modgam_QQplot,modgam_resid_hist, modgam_pva_plot, ncol=3)
+dev.off()
+```
+
+#PART ONE: The association of COVID-19 restrictions with the lifestyle and routine care of Dogslife dogs
+
+Sort the data
+```{r}
+dat <- full_join(pets2, qdat2) %>%
+    mutate(date_no_year = format(date_of_data_entry, "%m-%d"),
+         date_no_year = paste("0000-", date_no_year, sep = ""),
+         date_no_year = as.Date(date_no_year)) %>%
+    filter(date_no_year >= as.Date("0000-03-23") &
+           date_no_year <= as.Date("0000-07-04")) %>%
+    filter(date_of_data_entry >= as.Date("2011-02-01") &
+           date_of_data_entry  <= as.Date("2020-08-01")) %>%
+  select(-year_pet, -sleep_location, -date_no_year) %>%
+  mutate(which_year = case_when(year == 2020 ~ "Covid",
+                                TRUE ~ "Pre-covid"),
+         sex = case_when(sex == "female" ~ "Female",
+                         sex == "male" ~ "Male",
+                         TRUE ~ sex),
+         age = as.numeric((date_of_data_entry - DOB)/365),
+         age_year = floor(age),
+         age_year = case_when(age_year == 0 ~ "< 1",
+                              age_year >= 9 ~ "9 +",
+                              TRUE ~ as.character(age_year)),
+         age_cat = case_when(age < 1 ~'Under 1', #split age into catgories to be used
+                               age >= 1 & age < 3.5 ~ '1 to 3.4',
+                               age >= 3.5 & age < 7 ~ '3.5 to 6.9',
+                               age >= 7 ~ '7 or over',
+                               TRUE ~ as.character(age))) %>%
+  mutate_at(vars(which_year, pet_ID,name,sex, owner_ID, insurance_status, vet_reg_status, drink_type, feeding_type, feeding_times, titbits, sleeps_with_human, sleeps_with_pet, bathing_frequency, amount_of_exercise_reason, ends_with("last_visit"), year, age_cat, age_year), as.factor) %>%
+  select(pet_ID:date_of_data_entry, pet_type, year, which_year, weight, age, age_cat, age_year, insurance_status, vet_reg_status, drink_type:food_quantity, exercise_quantity, amount_of_exercise_reason,  anti_parasitic_since_last_visit:vacc_since_last_visit, sleeps_with_human, sleeps_with_pet, everything())
+
+dat$which_year <- factor(dat$which_year , levels = c("Pre-covid", "Covid"))
+dat$age_cat <- factor(dat$age_cat, levels = c("Under 1", "1 to 3.4", "3.5 to 6.9","7 or over"))
+
+#no of dogs
+length(unique(as.factor(dat$pet_ID)))
+
+#no of questionnaires
+length(as.factor(dat$pet_ID))
+
+#Numbers and proportions for Table 1
+with(dat, table(which_year))
+with(dat, table(which_year)) %>% prop.table()*100
+with(dat, table(sex, which_year))
+with(dat, table(sex, which_year)) %>% prop.table(margin = 2)*100
+with(dat, table(age_cat, which_year))
+with(dat, table(age_cat, which_year)) %>% prop.table(margin = 2)*100
+with(dat, table(pet_type, which_year))
+with(dat, table(pet_type, which_year)) %>% prop.table(margin = 2)*100
+```
+
+# Model selection for each variable of interest
+
+For GAM models, value of k chosen by using gam.check and checking p value is not significant and estimates of the model do not dramatically change with different values of k. k = 10 is default.
+
+### Dried food quantity 
+```{r}
+food_dat <- dat %>%
+  select(pet_ID, age, age_cat, age_year, sex, food_quantity = dried_food_quantity, which_year) %>%
+    drop_na() 
+
+sum(is.na(food_dat$food_quantity)) #missing
+
+#distribution pf data 
+ggplot(food_dat, aes(x =  food_quantity)) +
+  geom_histogram(bins = 20)
+
+#linear mixed model
+food_lmer <- lmer(food_quantity ~ age + sex + which_year + (1|pet_ID),
+              dat = food_dat)
+food_dat$predictions <- predict(food_lmer)
+rmse(food_dat$food_quantity, food_dat$predictions)
+AIC(food_lmer) 
+
+#general additive model
+food_gam <- gamm4(food_quantity ~ s(age, k = 30) + sex + which_year,
+                random = ~ (1|pet_ID),
+               dat = food_dat)
+
+food_dat$predictions <- predict(food_gam$mer)
+rmse(food_dat$food_quantity, food_dat$predictions)
+AIC(food_gam$mer) 
+
+food_dat$residuals <- residuals(food_gam$mer)
+summary(food_gam$mer)
+summary(food_gam$gam)
+gam.check(food_gam$gam) #k set to 30 
+tab_model(food_gam$mer)
+
+food_gamplot <- draw(food_gam$gam, select = "s(age)")  +
+  labs(x = "Age (Years)", y = "Centred smooth of age", title = "Food quantity") +
+  scale_y_continuous(limits = c(-150, 150)) +
+  annotate("text", x=5, y=150, label= "EDF = 24.26", size =4.5, fontface =2) +
+  theme_bw() +
+  theme(axis.title.y = element_text(face="bold", size=14),
+        axis.text.y  = element_text(size=14),
+        axis.title.x = element_text(face="bold", size=14),
+        axis.text.x  = element_text(size=14),
+        plot.title = element_text(face="bold", size=14, hjust = 0.5))
+food_gamplot
+
+food_QQplot <- ggplot(food_dat, aes(sample = residuals)) +
+  stat_qq() +
+  stat_qq_line(alpha = 0.3) +
+  labs(x = "Theoretical quantiles", y = "Sample quantiles") +
+  scale_x_continuous(limits = c(-5,5), breaks = c(-5, -2.5, 0, 2.5, 5)) +
+  scale_y_continuous(limits = c(-750,750), breaks = c(-750, -500,-250, 0, 250, 500,750)) +
+  theme_bw() +
+  theme(axis.title.y = element_text(face="bold", size=14),
+        axis.text.y  = element_text(size=14),
+        axis.title.x = element_text(face="bold", size=14),
+        axis.text.x  = element_text(size=14))
+food_QQplot
+
+food_pva_plot <- ggplot(food_dat, aes(x = predictions, y = food_quantity)) +
+  geom_point(alpha = 0.2) +
+  geom_abline(slope = 1, alpha = 0.3) +
+  scale_x_continuous(limits = c(-250, 1250)) +
+  scale_y_continuous(limits = c(-250, 1250)) +
+  labs(x = "Predicted values", y = "Actual values") +
+  theme_bw() +
+  theme(axis.title.y = element_text(face="bold", size=14),
+        axis.text.y  = element_text(size=14),
+        axis.title.x = element_text(face="bold", size=14),
+        axis.text.x  = element_text(size=14))
+food_pva_plot
+
+food_resid_hist <- ggplot(food_dat, aes(x = residuals)) +
+  geom_histogram(bins = 60)  +
+  labs(x = "Residuals", y = "Count") +
+  scale_x_continuous(limits = c(-750, 750), breaks = c(-750,-500,-250,0,250,500,750)) +
+  theme_bw() +
+  theme(axis.title.y = element_text(face="bold", size=14),
+        axis.text.y  = element_text(size=14),
+        axis.title.x = element_text(face="bold", size=14),
+        axis.text.x  = element_text(size=14))
+food_resid_hist
+
+tiff("Food_mod_checks.tiff", units="mm", width=300, height=100, res=300)
+grid.arrange(food_QQplot,food_resid_hist, food_pva_plot, ncol=3)
+dev.off()
+```
+
+# Exercise quantity
+
+```{r}
+ex_dat <- dat %>% 
+  select(pet_ID, age, age_year, sex, exercise_quantity, which_year) %>%
+  drop_na() 
+
+sum(is.na(ex_dat$exercise_quantity)) #missing
+
+#distribution of data
+ggplot(dat, aes(x =  exercise_quantity)) +
+  geom_histogram()
+
+sum(dat$exercise_quantity == 0) 
+
+#linear mixed model
+exercise_lmer <- lmer(exercise_quantity ~ age + sex + which_year + (1|pet_ID),
+              dat = ex_dat)
+ex_dat$predictions <- predict(exercise_lmer)
+rmse(ex_dat$exercise_quantity, ex_dat$predictions) 
+AIC(exercise_lmer)
+
+#general additive model
+exercise_gam <- gamm4(exercise_quantity ~ s(age) + sex + which_year,
+                random = ~ (1|pet_ID),
+               dat = ex_dat)
+
+ex_dat$predictions <- predict(exercise_gam$mer)
+rmse(ex_dat$exercise_quantity, ex_dat$predictions) 
+AIC(exercise_gam$mer) 
+
+summary(exercise_gam$mer)
+tab_model(exercise_gam$mer)
+ex_dat$residuals <- residuals(exercise_gam$mer)
+summary(exercise_gam$gam)
+gam.check(exercise_gam$gam) #k value does not need altering
+
+exercise_gamplot <- draw(exercise_gam$gam, select = "s(age)")  +
+  labs(x = "Age (Years)", y = "Centred smooth of age", title = "Exercise quantity") +
+  scale_y_continuous(limits = c(-150, 150)) +
+  annotate("text", x=5, y=150, label= "EDF = 8.55", size =4.5, fontface =2) +
+  theme_bw() +
+  theme(axis.title.y = element_text(face="bold", size=14),
+        axis.text.y  = element_text(size=14),
+        axis.title.x = element_text(face="bold", size=14),
+        axis.text.x  = element_text(size=14),
+        plot.title = element_text(face="bold", size=14, hjust = 0.5))
+exercise_gamplot
+
+exercise_QQplot <- ggplot(ex_dat, aes(sample = residuals)) +
+stat_qq() +
+stat_qq_line(alpha = 0.3) +
+labs(x = "Theoretical quantiles", y = "Sample quantiles") +
+scale_x_continuous(limits = c(-5,5), breaks = c(-5, -2.5, 0, 2.5, 5)) +
+scale_y_continuous(limits = c(-750,750), breaks = c(-750,-500,-250,0,250,500,750)) +
+theme_bw() +
+theme(axis.title.y = element_text(face="bold", size=14),
+axis.text.y  = element_text(size=14),
+axis.title.x = element_text(face="bold", size=14),
+axis.text.x  = element_text(size=14))
+exercise_QQplot
+
+exercise_pva_plot <- ggplot(ex_dat, aes(x = predictions, y = exercise_quantity)) +
+geom_point(alpha = 0.2) +
+  geom_abline(slope = 1, alpha = 0.3) +
+  scale_x_continuous(limits = c(-250, 1250)) +
+  scale_y_continuous(limits = c(-250, 1250)) +
+labs(x = "Predicted values", y = "Actual values") +
+theme_bw() +
+theme(axis.title.y = element_text(face="bold", size=14),
+axis.text.y  = element_text(size=14),
+axis.title.x = element_text(face="bold", size=14),
+axis.text.x  = element_text(size=14))
+exercise_pva_plot
+
+exercise_resid_hist <- ggplot(ex_dat, aes(x = residuals)) +
+  geom_histogram(bins = 60)  +
+  labs(x = "Residuals", y = "Count") +
+  scale_x_continuous(limits = c(-750, 750), breaks = c(-750,-500,-250,0,250,500,750)) +
+  theme_bw() +
+  theme(axis.title.y = element_text(face="bold", size=14),
+        axis.text.y  = element_text(size=14),
+        axis.title.x = element_text(face="bold", size=14),
+        axis.text.x  = element_text(size=14))
+exercise_resid_hist
+
+tiff("exercise_mod_checks.tiff", units="mm", width=300, height=100, res=300)
+grid.arrange(exercise_QQplot,exercise_resid_hist, exercise_pva_plot, ncol=3)
+dev.off()
+```
+
+# Insurance status
+
+```{r}
+sum(is.na(dat$insurance_status)) #missing
+
+insreg_dat <- dat %>%
+  select(pet_ID, age, age_year, sex, insurance_status, which_year) %>%
+  drop_na() 
+
+insreg_dat$insurance_status <- factor(insreg_dat$insurance_status, levels = c("no", "yes"))
+
+#GLM
+ins_glmer <- glmer(insurance_status ~ age + sex + which_year + (1|pet_ID),
+      family = binomial,
+      dat = insreg_dat)
+AIC(ins_glmer) 
+insreg_dat$predictions <- exp(predict(ins_glmer))
+pROC_insreg <- pROC::roc(insreg_dat$insurance_status, insreg_dat$predictions,plot = FALSE,percent = TRUE)
+pROC::auc(pROC_insreg)
+pROC::ci.auc(pROC_insreg)
+
+#GAMM 
+ins_gamre <- gamm4(insurance_status == "yes" ~ s(age) + sex + which_year,
+                random = ~ (1|pet_ID),
+                family = binomial,
+               dat = insreg_dat)
+
+AIC(ins_gamre$mer) 
+insreg_dat$predictions <- exp(predict(ins_gamre$mer))
+insreg_dat$residuals <- residuals(ins_gamre$mer)
+pROC_insreg <- pROC::roc(insreg_dat$insurance_status, insreg_dat$predictions,
+                        smoothed = TRUE,
+                         # arguments for ci
+                         ci=TRUE, ci.alpha=0.95, stratified=FALSE,
+                         # arguments for plot
+                         plot=TRUE, auc.polygon=TRUE, max.auc.polygon=TRUE, grid=TRUE,
+                         print.auc=TRUE, show.thres=TRUE, percent = TRUE)
+pROC::auc(pROC_insreg) 
+pROC::ci.auc(pROC_insreg) 
+
+summary(ins_gamre$mer)
+tab_model(ins_gamre$mer)
+summary(ins_gamre$gam)
+gam.check(ins_gamre$gam) #k value does not need altering
+
+ins_gamplot <- draw(ins_gamre$gam, select = "s(age)")  +
+  labs(x = "Age (Years)", y = "Centred smooth of age", title = "Insurance status") +
+  scale_y_continuous(limits = c(-4, 4)) +
+  annotate("text", x=5, y=4, label= "EDF = 1", size =4.5, fontface =2) +
+  theme_bw() +
+  theme(axis.title.y = element_text(face="bold", size=14),
+        axis.text.y  = element_text(size=14),
+        axis.title.x = element_text(face="bold", size=14),
+        axis.text.x  = element_text(size=14),
+        plot.title = element_text(face="bold", size=14, hjust = 0.5))
+ins_gamplot
+```
+
+# Titbits status
+```{r}
+sum(is.na(dat$titbits)) #missing
+
+titbits_dat <- dat %>%
+  select(pet_ID, age, age_year, sex, titbits, which_year) %>%
+  drop_na() 
+
+titbits_dat$titbits <- factor(titbits_dat$titbits, levels = c("no", "yes"))
+
+#GLM
+titbits_glmer <- glmer(titbits ~ age + sex + which_year + (1|pet_ID),
+      family = binomial,
+       dat = titbits_dat,
+      control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+summary(titbits_glmer)
+ AIC(titbits_glmer)
+ titbits_dat$predictions <- exp(predict(titbits_glmer))
+ pROC_titbits <- pROC::roc(titbits_dat$titbits, titbits_dat$predictions,plot = FALSE,percent = TRUE)
+ pROC::auc(pROC_titbits)
+ pROC::ci.auc(pROC_titbits)
+
+#GAMM
+titbits_gamre <- gamm4(titbits == "yes" ~ s(age) + sex + which_year,
+                random = ~ (1|pet_ID),
+                family = binomial,
+               dat = titbits_dat)
+
+AIC(titbits_gamre$mer) 
+titbits_dat$predictions <- exp(predict(titbits_gamre$mer))
+titbits_dat$residuals <- residuals(titbits_gamre$mer)
+pROC_titbits <- pROC::roc(titbits_dat$titbits, titbits_dat$predictions,
+                        smoothed = TRUE,
+                         # arguments for ci
+                         ci=TRUE, ci.alpha=0.95, stratified=FALSE,
+                         # arguments for plot
+                         plot=TRUE, auc.polygon=TRUE, max.auc.polygon=TRUE, grid=TRUE,
+                         print.auc=TRUE, show.thres=TRUE, percent = TRUE)
+pROC::auc(pROC_titbits) 
+pROC::ci.auc(pROC_titbits) 
+
+summary(titbits_gamre$mer) 
+tab_model(titbits_gamre$mer)
+summary(titbits_gamre$gam)
+gam.check(titbits_gamre$gam) #k value does not need altering
+
+titbits_gamplot <- draw(titbits_gamre$gam, select = "s(age)")  +
+  labs(x = "Age (Years)", y = "Centred smooth of age", title = "Titbits") +
+  scale_y_continuous(limits = c(-4, 4)) +
+  annotate("text", x=5, y=4, label= "EDF = 5.44", size =4.5, fontface =2) +
+  theme_bw() +
+  theme(axis.title.y = element_text(face="bold", size=14),
+        axis.text.y  = element_text(size=14),
+        axis.title.x = element_text(face="bold", size=14),
+        axis.text.x  = element_text(size=14),
+        plot.title = element_text(face="bold", size=14, hjust = 0.5))
+titbits_gamplot
+```
+
+# Sleeps with human at night status 
+
+```{r}
+sum(is.na(dat$sleeps_with_human)) #missing
+
+sleeps_with_human_dat <- dat %>%
+  select(pet_ID, age, age_year, sex, sleeps_with_human, which_year) %>%
+  drop_na() 
+
+sleeps_with_human_dat$sleeps_with_human <- factor(sleeps_with_human_dat$sleeps_with_human, levels = c("no", "yes"))
+
+#GLM
+sleeps_with_human_glmer <- glmer(sleeps_with_human ~ age + sex + which_year + (1|pet_ID),
+      family = binomial,
+      dat = sleeps_with_human_dat)
+AIC(sleeps_with_human_glmer) 
+sleeps_with_human_dat$predictions <- exp(predict(sleeps_with_human_glmer))
+pROC_sleeps_with_human <- pROC::roc(sleeps_with_human_dat$sleeps_with_human, sleeps_with_human_dat$predictions,plot = FALSE,percent = TRUE)
+pROC::auc(pROC_sleeps_with_human)
+pROC::ci.auc(pROC_sleeps_with_human) 
+
+#GAMM
+sleeps_with_human_gamre <- gamm4(sleeps_with_human == "yes" ~ s(age, k = 20) + sex + which_year,
+                random = ~ (1|pet_ID),
+                family = binomial,
+               dat = sleeps_with_human_dat)
+AIC(sleeps_with_human_gamre$mer) 
+sleeps_with_human_dat$predictions <- exp(predict(sleeps_with_human_gamre$mer))
+sleeps_with_human_dat$residuals <- residuals(sleeps_with_human_gamre$mer)
+pROC_sleeps_with_human <- pROC::roc(sleeps_with_human_dat$sleeps_with_human, sleeps_with_human_dat$predictions,
+                        smoothed = TRUE,
+                         # arguments for ci
+                         ci=TRUE, ci.alpha=0.95, stratified=FALSE,
+                         # arguments for plot
+                         plot=TRUE, auc.polygon=TRUE, max.auc.polygon=TRUE, grid=TRUE,
+                         print.auc=TRUE, show.thres=TRUE, percent = TRUE)
+pROC::auc(pROC_sleeps_with_human) 
+pROC::ci.auc(pROC_sleeps_with_human) 
+
+summary(sleeps_with_human_gamre$mer)
+tab_model(sleeps_with_human_gamre$mer)
+summary(sleeps_with_human_gamre$gam)
+gam.check(sleeps_with_human_gamre$gam) #k value changed to 20
+
+sleeps_with_human_gamplot <- draw(sleeps_with_human_gamre$gam, select = "s(age)")  +
+  labs(x = "Age (Years)", y = "Centred smooth of age", title = "Dog sleeps with human") +
+  scale_y_continuous(limits = c(-8, 8), breaks = c(-8,-4,0,4,8)) +
+  annotate("text", x=5, y=8, label= "EDF = 6.24", size =4.5, fontface =2) +
+  theme_bw() +
+  theme(axis.title.y = element_text(face="bold", size=14),
+        axis.text.y  = element_text(size=14),
+        axis.title.x = element_text(face="bold", size=14),
+        axis.text.x  = element_text(size=14),
+        plot.title = element_text(face="bold", size=14, hjust = 0.5))
+sleeps_with_human_gamplot
+```
+
+# Bathed since last visit 
+```{r}
+sum(is.na(dat$bathed_since_last_visit)) #missing
+
+bathed_since_last_visit_dat <- dat %>%
+  select(pet_ID, age, age_year, sex, bathed_since_last_visit, which_year) %>%
+  drop_na() 
+
+bathed_since_last_visit_dat$bathed_since_last_visit <- factor(bathed_since_last_visit_dat$bathed_since_last_visit, levels = c("no", "yes"))
+
+#GLM
+bathed_since_last_visit_glmer <- glmer(bathed_since_last_visit ~ age + sex + which_year + (1|pet_ID),
+      family = binomial,
+      dat = bathed_since_last_visit_dat)
+AIC(bathed_since_last_visit_glmer) 
+bathed_since_last_visit_dat$predictions <- exp(predict(bathed_since_last_visit_glmer))
+pROC_bathed_since_last_visit <- pROC::roc(bathed_since_last_visit_dat$bathed_since_last_visit, bathed_since_last_visit_dat$predictions,plot = FALSE,percent = TRUE)
+pROC::auc(pROC_bathed_since_last_visit)
+pROC::ci.auc(pROC_bathed_since_last_visit)
+
+#GAMM
+bathed_since_last_visit_gamre <- gamm4(bathed_since_last_visit == "yes" ~ s(age, k = 40) + sex + which_year,
+                random = ~ (1|pet_ID),
+                family = binomial,
+               dat = bathed_since_last_visit_dat)
+
+AIC(bathed_since_last_visit_gamre$mer) 
+bathed_since_last_visit_dat$predictions <- exp(predict(bathed_since_last_visit_gamre$mer))
+bathed_since_last_visit_dat$residuals <- residuals(bathed_since_last_visit_gamre$mer)
+pROC_bathed_since_last_visit <- pROC::roc(bathed_since_last_visit_dat$bathed_since_last_visit, bathed_since_last_visit_dat$predictions,
+                        smoothed = TRUE,
+                         # arguments for ci
+                         ci=TRUE, ci.alpha=0.95, stratified=FALSE,
+                         # arguments for plot
+                         plot=TRUE, auc.polygon=TRUE, max.auc.polygon=TRUE, grid=TRUE,
+                         print.auc=TRUE, show.thres=TRUE, percent = TRUE)
+pROC::auc(pROC_bathed_since_last_visit) 
+pROC::ci.auc(pROC_bathed_since_last_visit)
+
+summary(bathed_since_last_visit_gamre$mer)
+tab_model(bathed_since_last_visit_gamre$mer, digits = 4)
+summary(bathed_since_last_visit_gamre$gam)
+gam.check(bathed_since_last_visit_gamre$gam) #k value changed to 40
+
+bathed_since_last_visit_gamplot <- draw(bathed_since_last_visit_gamre$gam, select = "s(age)")  +
+  labs(x = "Age (Years)", y = "Centred smooth of age", title = "Bathed since last visit") +
+  scale_y_continuous(limits = c(-2, 2)) +
+  annotate("text", x=5, y=2, label= "EDF = 18.60", size =4.5, fontface =2) +
+  theme_bw() +
+  theme(axis.title.y = element_text(face="bold", size=14),
+        axis.text.y  = element_text(size=14),
+        axis.title.x = element_text(face="bold", size=14),
+        axis.text.x  = element_text(size=14),
+        plot.title = element_text(face="bold", size=14, hjust = 0.5))
+bathed_since_last_visit_gamplot
+```
+
+# Anti parasitic since last visit 
+```{r}
+sum(is.na(dat$anti_parasitic_since_last_visit)) #missing
+
+anti_parasitic_since_last_visit_dat <- dat %>%
+  select(pet_ID, age, age_year, sex, anti_parasitic_since_last_visit, which_year) %>%
+  drop_na() 
+
+anti_parasitic_since_last_visit_dat$anti_parasitic_since_last_visit <- factor(anti_parasitic_since_last_visit_dat$anti_parasitic_since_last_visit, levels = c("no", "yes"))
+
+#GLM
+anti_parasitic_since_last_visit_glmer <- glmer(anti_parasitic_since_last_visit ~ age + sex + which_year + (1|pet_ID),
+      family = binomial,
+      dat = anti_parasitic_since_last_visit_dat)
+AIC(anti_parasitic_since_last_visit_glmer)
+anti_parasitic_since_last_visit_dat$predictions <- exp(predict(anti_parasitic_since_last_visit_glmer))
+pROC_anti_parasitic_since_last_visit <- pROC::roc(anti_parasitic_since_last_visit_dat$anti_parasitic_since_last_visit, anti_parasitic_since_last_visit_dat$predictions,plot = FALSE,percent = TRUE)
+pROC::auc(pROC_anti_parasitic_since_last_visit) 
+pROC::ci.auc(pROC_anti_parasitic_since_last_visit)
+
+#GAMM
+anti_parasitic_since_last_visit_gamre <- gamm4(anti_parasitic_since_last_visit == "yes" ~ s(age) + sex + which_year,
+                random = ~ (1|pet_ID),
+                family = binomial,
+               dat = anti_parasitic_since_last_visit_dat)
+
+AIC(anti_parasitic_since_last_visit_gamre$mer) 
+anti_parasitic_since_last_visit_dat$predictions <- exp(predict(anti_parasitic_since_last_visit_gamre$mer))
+anti_parasitic_since_last_visit_dat$residuals <- residuals(anti_parasitic_since_last_visit_gamre$mer)
+pROC_anti_parasitic_since_last_visit <- pROC::roc(anti_parasitic_since_last_visit_dat$anti_parasitic_since_last_visit, anti_parasitic_since_last_visit_dat$predictions,
+                        smoothed = TRUE,
+                         # arguments for ci
+                         ci=TRUE, ci.alpha=0.95, stratified=FALSE,
+                         # arguments for plot
+                         plot=TRUE, auc.polygon=TRUE, max.auc.polygon=TRUE, grid=TRUE,
+                         print.auc=TRUE, show.thres=TRUE, percent = TRUE)
+pROC::auc(pROC_anti_parasitic_since_last_visit) 
+pROC::ci.auc(pROC_anti_parasitic_since_last_visit) 
+
+summary(anti_parasitic_since_last_visit_gamre$mer)
+tab_model(anti_parasitic_since_last_visit_gamre$mer, digits = 4)
+
+summary(anti_parasitic_since_last_visit_gamre$gam)
+gam.check(anti_parasitic_since_last_visit_gamre$gam) #k value does not need altering
+
+anti_parasitic_since_last_visit_gamplot <- draw(anti_parasitic_since_last_visit_gamre$gam, select = "s(age)")  +
+  labs(x = "Age (Years)", y = "Centred smooth of age", title = "Anti-parasitic since last visit") +
+  scale_y_continuous(limits = c(-1, 1)) +
+  annotate("text", x=5, y=1, label= "EDF = 5.88", size =4.5, fontface =2) +
+  theme_bw() +
+  theme(axis.title.y = element_text(face="bold", size=14),
+        axis.text.y  = element_text(size=14),
+        axis.title.x = element_text(face="bold", size=14),
+        axis.text.x  = element_text(size=14),
+        plot.title = element_text(face="bold", size=14, hjust = 0.5))
+anti_parasitic_since_last_visit_gamplot
+```
+
+# Wormed since last visit 
+```{r}
+sum(is.na(dat$wormed_since_last_visit)) #missing
+
+wormed_since_last_visit_dat <- dat %>%
+  select(pet_ID, age, age_year, sex, wormed_since_last_visit, which_year) %>%
+  drop_na() 
+
+wormed_since_last_visit_dat$wormed_since_last_visit <- factor(wormed_since_last_visit_dat$wormed_since_last_visit, levels = c("no", "yes"))
+
+#GLM
+
+wormed_since_last_visit_glmer <- glmer(wormed_since_last_visit ~ age + sex + which_year + (1|pet_ID),
+      family = binomial,
+      dat = wormed_since_last_visit_dat)
+AIC(wormed_since_last_visit_glmer) 
+wormed_since_last_visit_dat$predictions <- exp(predict(wormed_since_last_visit_glmer))
+pROC_wormed_since_last_visit <- pROC::roc(wormed_since_last_visit_dat$wormed_since_last_visit, wormed_since_last_visit_dat$predictions,plot = FALSE,percent = TRUE)
+pROC::auc(pROC_wormed_since_last_visit) 
+pROC::ci.auc(pROC_wormed_since_last_visit) 
+
+#GAMM
+wormed_since_last_visit_gamre <- gamm4(wormed_since_last_visit == "yes" ~ s(age, k = 30) + sex + which_year,
+                random = ~ (1|pet_ID),
+                family = binomial,
+               dat = wormed_since_last_visit_dat)
+
+AIC(wormed_since_last_visit_gamre$mer)
+wormed_since_last_visit_dat$predictions <- exp(predict(wormed_since_last_visit_gamre$mer))
+wormed_since_last_visit_dat$residuals <- residuals(wormed_since_last_visit_gamre$mer)
+pROC_wormed_since_last_visit <- pROC::roc(wormed_since_last_visit_dat$wormed_since_last_visit, wormed_since_last_visit_dat$predictions,
+                        smoothed = TRUE,
+                         # arguments for ci
+                         ci=TRUE, ci.alpha=0.95, stratified=FALSE,
+                         # arguments for plot
+                         plot=TRUE, auc.polygon=TRUE, max.auc.polygon=TRUE, grid=TRUE,
+                         print.auc=TRUE, show.thres=TRUE, percent = TRUE)
+pROC::auc(pROC_wormed_since_last_visit)
+pROC::ci.auc(pROC_wormed_since_last_visit)
+
+summary(wormed_since_last_visit_gamre$mer)
+tab_model(wormed_since_last_visit_gamre$mer)
+summary(wormed_since_last_visit_gamre$gam)
+gam.check(wormed_since_last_visit_gamre$gam) #k value changed to 30
+
+wormed_since_last_visit_gamplot <- draw(wormed_since_last_visit_gamre$gam, select = "s(age)")  +
+  labs(x = "Age (Years)", y = "Centred smooth of age", title = "Wormed since last visit") +
+  scale_y_continuous(limits = c(-2, 2)) +
+  annotate("text", x=5, y=2, label= "EDF = 19.82", size =4.5, fontface =2) +
+  theme_bw() +
+  theme(axis.title.y = element_text(face="bold", size=14),
+        axis.text.y  = element_text(size=14),
+        axis.title.x = element_text(face="bold", size=14),
+        axis.text.x  = element_text(size=14),
+        plot.title = element_text(face="bold", size=14, hjust = 0.5))
+wormed_since_last_visit_gamplot
+```
+
+# Vacc since last visit
+```{r}
+sum(is.na(dat$vacc_since_last_visit)) #missing
+
+vacc_since_last_visit_dat <- dat %>%
+  select(pet_ID, age, age_year, sex, vacc_since_last_visit, which_year) %>%
+  drop_na() 
+
+vacc_since_last_visit_dat$vacc_since_last_visit <- factor(vacc_since_last_visit_dat$vacc_since_last_visit, levels = c("no", "yes"))
+
+#GLM 
+vacc_since_last_visit_glmer <- glmer(vacc_since_last_visit ~ age + sex + which_year + (1|pet_ID),
+      family = binomial,
+      dat = vacc_since_last_visit_dat)
+AIC(vacc_since_last_visit_glmer) 
+vacc_since_last_visit_dat$predictions <- exp(predict(vacc_since_last_visit_glmer))
+pROC_vacc_since_last_visit <- pROC::roc(vacc_since_last_visit_dat$vacc_since_last_visit, vacc_since_last_visit_dat$predictions,plot = FALSE,percent = TRUE)
+pROC::auc(pROC_vacc_since_last_visit)
+pROC::ci.auc(pROC_vacc_since_last_visit) 
+
+#GAMM
+vacc_since_last_visit_gamre <- gamm4(vacc_since_last_visit == "yes" ~ s(age, k = 40) + sex + which_year,
+                random = ~ (1|pet_ID),
+                family = binomial,
+               dat = vacc_since_last_visit_dat)
+
+AIC(vacc_since_last_visit_gamre$mer)
+vacc_since_last_visit_dat$predictions <- exp(predict(vacc_since_last_visit_gamre$mer))
+vacc_since_last_visit_dat$residuals <- residuals(vacc_since_last_visit_gamre$mer)
+pROC_vacc_since_last_visit <- pROC::roc(vacc_since_last_visit_dat$vacc_since_last_visit, vacc_since_last_visit_dat$predictions,
+                        smoothed = TRUE,
+                         # arguments for ci
+                         ci=TRUE, ci.alpha=0.95, stratified=FALSE,
+                         # arguments for plot
+                         plot=TRUE, auc.polygon=TRUE, max.auc.polygon=TRUE, grid=TRUE,
+                         print.auc=TRUE, show.thres=TRUE, percent = TRUE)
+pROC::auc(pROC_vacc_since_last_visit) 
+pROC::ci.auc(pROC_vacc_since_last_visit)
+
+summary(vacc_since_last_visit_gamre$mer)
+tab_model(vacc_since_last_visit_gamre$mer)
+summary(vacc_since_last_visit_gamre$gam)
+gam.check(vacc_since_last_visit_gamre$gam) #k value changed to 40
+
+vacc_since_last_visit_gamplot <- draw(vacc_since_last_visit_gamre$gam, select = "s(age)")  +
+labs(x = "Age (Years)", y = "Centred smooth of age", title = "Vaccinated since last visit") +
+scale_y_continuous(limits = c(-3, 3)) +
+annotate("text", x=5, y=3, label= "EDF = 36.43", size =4.5, fontface =2) +
+theme_bw() +
+theme(axis.title.y = element_text(face="bold", size=14),
+axis.text.y  = element_text(size=14),
+axis.title.x = element_text(face="bold", size=14),
+axis.text.x  = element_text(size=14),
+plot.title = element_text(face="bold", size=14, hjust = 0.5))
+vacc_since_last_visit_gamplot
+```
+
+# Figures for paper (additional file 1)
+```{r}
+paper2 <- ggarrange(exercise_gamplot,
+                    food_gamplot,
+                    ins_gamplot,
+                    titbits_gamplot,
+                    sleeps_with_human_gamplot,
+                    bathed_since_last_visit_gamplot,
+                    anti_parasitic_since_last_visit_gamplot,
+                    wormed_since_last_visit_gamplot,
+                    vacc_since_last_visit_gamplot,
+                    ncol = 3,
+                    nrow = 3,
+                    common.legend = TRUE)
+paper2
+
+ggsave(filename = "Model_gam_curves.tiff",
+       plot = paper2,
+       width = 300, height = 220, units = 'mm',
+       limitsize = FALSE,
+       dpi = 300)
+```
+
+# PART TWO: The association of COVID-19 restrictions with illness incidence and associated veterinary attendance in Dogslife 
+
+# Any illness
+
+Data preperation
+```{r}
+illness2b <- illness2 %>%
+      mutate(date_no_year = format(date_of_data_entry, "%m-%d"),
+         date_no_year = paste("0000-", date_no_year, sep = ""),
+         date_no_year = as.Date(date_no_year)) %>%
+    filter(date_no_year >= as.Date("0000-03-23") &
+           date_no_year <= as.Date("0000-07-23")) %>%
+    filter(date_of_data_entry >= as.Date("2011-02-01") &
+           date_of_data_entry  <= as.Date("2020-08-01")) %>%
+  select(pet_ID, name, date_of_data_entry, episode, start_date, end_date, vet_visit, vet_visit_date, ill_type, time_to_see_vet, duration, freq, type) 
+
+illness_filt3 <- illness2b %>%
+  filter(episode == "yes")
+
+#proportion of illness entries with a start date
+length(illness_filt3$pet_ID) 
+sum(!is.na(illness_filt3$start_date)) 
+((sum(!is.na(illness_filt3$start_date))/length(illness_filt3$pet_ID))*100)
+
+#process data for analysis
+illness3 <- illness2b %>%
+  left_join(pets2) %>%
+  mutate(year = year(date_of_data_entry),
+         sdate_year = year(start_date),
+         sdate_no_year = format(start_date, "%m-%d"), #remove dates before start dates where poss
+         sdate_no_year = paste("0000-", sdate_no_year, sep = ""),
+         sdate_no_year = as.Date(sdate_no_year),
+         data_to_remove1 = case_when(is.na(sdate_no_year) ~ FALSE,
+                                    sdate_no_year < as.Date("0000-03-23") |
+                                      sdate_year < year ~ TRUE,
+                                    TRUE ~ FALSE),
+         data_to_remove2 = case_when(is.na(sdate_no_year) ~ FALSE,
+                                    sdate_no_year > as.Date("0000-07-04") ~ TRUE,
+                                    TRUE ~ FALSE)) %>%
+  mutate_at(vars(episode, vet_visit), ~ case_when(data_to_remove1 == TRUE | data_to_remove2 == TRUE ~ "no",
+TRUE ~ .)) %>%
+  mutate_at(vars(time_to_see_vet, duration), ~ case_when(data_to_remove1 == TRUE | data_to_remove2 == TRUE ~ NA_real_,
+TRUE ~ .)) %>%
+  mutate_at(vars(start_date, end_date, vet_visit_date), ~ case_when(data_to_remove1 == TRUE | data_to_remove2 == TRUE ~ as.Date(NA_real_),
+TRUE ~ .)) %>%
+  mutate(real_date = as.Date(case_when(is.na(start_date) == TRUE ~ as.character(date_of_data_entry),
+                                       TRUE ~ as.character(start_date))),
+         sex = case_when(sex == "female" ~ "Female",
+                         sex == "male" ~ "Male",
+                         TRUE ~ sex),
+          which_year = case_when(year == 2020 ~ "Covid",
+                                TRUE ~ "Pre-covid"),
+         age = as.numeric((real_date - DOB)/365),
+         age_year = floor(age),
+         age_year = case_when(age_year == 0 ~ "< 1",
+                              age_year >= 9 ~ "9 +",
+                              TRUE ~ as.character(age_year)),
+         age_cat = case_when(age < 1 ~'Under 1', #split age into catgories to be used
+                             age >= 1 & age < 3.5 ~ '1 to 3.4',
+                             age >= 3.5 & age < 7 ~ '3.5 to 6.9',
+                             age >= 7 ~ '7 or over',
+                             TRUE ~ as.character(age)),
+         vet_visit = case_when(is.na(vet_visit) ~ "no",
+                               TRUE ~ vet_visit),
+         time_to_see_vet = case_when(vet_visit == "no" ~ NA_real_,
+                                     TRUE ~ time_to_see_vet)) %>%
+  mutate_at(vars(which_year, year, pet_ID, name, sex, year, age_cat, age_year), as.factor)
+
+#This removed illness episodes from before March 23rd
+sum(illness3$data_to_remove1 == TRUE)
+
+#This removed illness episodes from after July 4th
+sum(illness3$data_to_remove2 == TRUE)
+
+illness_filt4 <- illness3 %>%
+  filter(episode == "yes")
+
+length(illness_filt4$pet_ID)
+sum(!is.na(illness_filt4$start_date)) 
+((sum(!is.na(illness_filt4$start_date))/length(illness_filt4$pet_ID))*100) 
+
+#BEFORE DATA TO REMOVE HOW MANY QUESTIONNAIRES HAD ILLNESS EPISODES?
+illdat_before <- illness2b %>%
+  select(pet_ID, date_of_data_entry, episode) %>%
+  group_by(pet_ID, date_of_data_entry) %>%
+  mutate(any_ill = any(episode == "yes")) %>%
+  ungroup() %>%
+   select(-episode) %>%
+  distinct() 
+  
+table(illdat_before$any_ill)
+
+#NOW WITH DATA REMOVED
+illdat <- illness3 %>%
+  select(pet_ID, date_of_data_entry, episode, age_cat, sex, which_year) %>%
+  group_by(pet_ID, date_of_data_entry) %>%
+  mutate(any_ill = any(episode == "yes"), 
+         age_cat = case_when(any_ill == TRUE & episode == "no" ~ NA_character_,
+                             TRUE ~ as.character(age_cat))) %>%
+  fill(age_cat, .direction = "downup") %>%
+    select(-episode) %>%
+  distinct() 
+
+illdat$age_cat <- factor(illdat$age_cat, levels = c("Under 1", "1 to 3.4", "3.5 to 6.9","7 or over"), ordered = TRUE)
+
+illdat <- illdat %>%
+  group_by(pet_ID, date_of_data_entry) %>%
+  mutate(rown = max(row_number()),
+         age_cat = case_when(rown == 2 ~ max(age_cat),
+                              TRUE ~ age_cat)) %>%
+  ungroup() %>%
+  select(-rown) %>%
+  distinct() 
+
+table(illdat$any_ill)
+
+#how many were removed?
+table(illdat_before$any_ill)[2] - table(illdat$any_ill)[2]
+```
+
+# Were there more any illness reports?
+
+```{r}
+illdat$which_year <- factor(illdat$which_year, levels = c("Covid", "Pre-covid"))
+illdat$any_ill <- factor(illdat$any_ill, levels = c(TRUE, FALSE))
+
+## covids vomiting INCIDENCE in comparison to the same dates on previous years, statisfied by age
+#put data into frequency table
+  strat_table <- table(illdat$any_ill, illdat$which_year, illdat$age_cat)
+  
+#run adjusted chi-squared by age
+  risk_epi <- epi.2by2(dat = strat_table, method = "cohort.count", 
+                       conf.level = 0.95, outcome = "as.columns")
+  risk_epi
+
+length(illdat$pet_ID)  
+
+length(unique(as.factor(illdat$pet_ID)))
+#Proportion tables  
+with(illdat, table(any_ill, which_year))
+with(illdat, table(any_ill, which_year)) %>% prop.table(margin = 2)*100
+
+#Proportion tables   - age
+with(illdat, table(any_ill, which_year, age_cat))
+with(illdat, table(any_ill, which_year, age_cat)) %>% prop.table(margin = 2)*100
+
+#Proportion tables - sex
+with(illdat, table(any_ill, which_year, sex))
+with(illdat, table(any_ill, which_year, sex)) %>% prop.table(margin = 2)*100
+```
+
+# Were owners more likely to take their dog to the vet with any illness?
+
+```{r}
+vetdat1 <- illness3 %>%
+  select(pet_ID, date_of_data_entry, episode, vet_visit, age_cat, which_year) %>%
+  filter(episode == "yes")
+
+length(vetdat1$pet_ID)
+
+vetdat1$age_cat <- factor(vetdat1$age_cat, levels = c("Under 1", "1 to 3.4", "3.5 to 6.9","7 or over"), ordered = TRUE)  
+
+vetdat <- vetdat1 %>%
+  group_by(pet_ID, date_of_data_entry) %>%
+  mutate(any_vet_visit = any(vet_visit == "yes")) %>%
+  select(-vet_visit) %>%
+  distinct() %>%
+  mutate(rown = max(row_number()),
+         age_cat = case_when(rown == 2 ~ max(age_cat),
+                              TRUE ~ age_cat)) %>%
+  ungroup() %>%
+  select(-rown) %>%
+  distinct() 
+
+length(vetdat$pet_ID)
+table(vetdat$any_vet_visit)
+
+#missing
+sum(is.na(vetdat$any_vet_visit))
+vetdat$any_vet_visit <- factor(vetdat$any_vet_visit, levels = c("TRUE", "FALSE"))
+vetdat$which_year <- factor(vetdat$which_year, levels = c("Covid", "Pre-covid"))
+
+vettab <- table(vetdat$any_vet_visit, vetdat$which_year, vetdat$age_cat)
+
+#run adjusted chi-squared by age
+vetill_epi <- epi.2by2(dat = vettab, method = "cohort.count",
+                       conf.level = 0.95, outcome = "as.columns")
+vetill_epi
+
+length(vetdat$pet_ID)
+#Proportion tables  
+with(vetdat, table(any_vet_visit, which_year))
+with(vetdat, table(any_vet_visit, which_year)) %>% prop.table(margin = 2)*100
+```
+
+## Vomiting
+
+### Did the incidence of vomiting differ?
+
+```{r}
+vomdat <- illness3 %>%
+  filter(ill_type == "vomiting") 
+
+vomdat$which_year <- factor(vomdat$which_year, levels = c("Covid", "Pre-covid"))
+vomdat$episode <- factor(vomdat$episode, levels = c("yes", "no"))
+
+## covids vomiting INCIDENCE in comparison to the same dates on previous years, statisfied by age
+#put data into frequency table
+  strat_table1 <- table(vomdat$episode, vomdat$which_year, vomdat$age_cat)
+  
+#run adjusted chi-squared by age
+  risk_epi1 <- epi.2by2(dat = strat_table1, method = "cohort.count", 
+                       conf.level = 0.95, outcome = "as.columns")
+  risk_epi1
+  
+  length(vomdat$pet_ID)
+#Proportion tables  
+with(vomdat, table(episode, which_year))
+with(vomdat, table(episode, which_year)) %>% prop.table(margin = 2)*100
+```
+
+## diarrhoea
+```{r}
+diadat <- illness3 %>%
+  filter(ill_type == "diarrhoea") 
+
+diadat$which_year <- factor(diadat$which_year, levels = c("Covid", "Pre-covid"))
+diadat$episode <- factor(diadat$episode, levels = c("yes", "no"))
+
+## covids diarrhoea INCIDENCE in comparison to the same dates on previous years, statisfied by age
+#put data into frequency table
+  strat_table2 <- table(diadat$episode, diadat$which_year, diadat$age_cat)
+  
+#run adjusted chi-squared by age
+  risk_epi2 <- epi.2by2(dat = strat_table2, method = "cohort.count", 
+                       conf.level = 0.95, outcome = "as.columns")
+
+  risk_epi2
+  
+  length(diadat$pet_ID)  
+  #Proportion tables  
+with(diadat, table(episode, which_year))
+with(diadat, table(episode, which_year)) %>% prop.table(margin = 2)*100
+```
+  
+## coughing
+```{r}
+coughdat <- illness3 %>%
+  filter(ill_type == "coughing") 
+
+coughdat$which_year <- factor(coughdat$which_year, levels = c("Covid", "Pre-covid"))
+coughdat$episode <- factor(coughdat$episode, levels = c("yes", "no"))
+
+## covids coughing INCIDENCE in comparison to the same dates on previous years, statisfied by age
+#put data into frequency table
+  strat_table3 <- table(coughdat$episode, coughdat$which_year, coughdat$age_cat)
+  
+#run adjusted chi-squared by age
+  risk_epi3 <- epi.2by2(dat = strat_table3, method = "cohort.count", 
+                       conf.level = 0.95, outcome = "as.columns")
+
+  risk_epi3
+  
+    length(coughdat$pet_ID)  
+  #Proportion tables  
+with(coughdat, table(episode, which_year))
+with(coughdat, table(episode, which_year)) %>% prop.table(margin = 2)*100
+```
+
+## scratching
+```{r}
+scratchdat <- illness3 %>%
+  filter(ill_type == "scratching") 
+
+scratchdat$which_year <- factor(scratchdat$which_year, levels = c("Covid", "Pre-covid"))
+scratchdat$episode <- factor(scratchdat$episode, levels = c("yes", "no"))
+
+## covids scratching INCIDENCE in comparison to the same dates on previous years, statisfied by age
+#put data into frequency table
+  strat_table4 <- table(scratchdat$episode, scratchdat$which_year, scratchdat$age_cat)
+  
+#run adjusted chi-squared by age
+  risk_epi4 <- epi.2by2(dat = strat_table4, method = "cohort.count", 
+                       conf.level = 0.95, outcome = "as.columns")
+
+  risk_epi4
+  
+    length(scratchdat$pet_ID)  
+  #Proportion tables  
+with(scratchdat, table(episode, which_year))
+with(scratchdat, table(episode, which_year)) %>% prop.table(margin = 2)*100
+```
+
+
+## licking_or_chewing
+```{r}
+lickdat <- illness3 %>%
+  filter(ill_type == "licking_or_chewing") 
+
+lickdat$which_year <- factor(lickdat$which_year, levels = c("Covid", "Pre-covid"))
+lickdat$episode <- factor(lickdat$episode, levels = c("yes", "no"))
+
+## covids licking_or_chewing INCIDENCE in comparison to the same dates on previous years, statisfied by age
+#put data into frequency table
+  strat_table5 <- table(lickdat$episode, lickdat$which_year, lickdat$age_cat)
+  
+#run adjusted chi-squared by age
+  risk_epi5 <- epi.2by2(dat = strat_table5, method = "cohort.count", 
+                       conf.level = 0.95, outcome = "as.columns")
+
+  risk_epi5
+  
+    length(lickdat$pet_ID)  
+  #Proportion tables  
+with(lickdat, table(episode, which_year))
+with(lickdat, table(episode, which_year)) %>% prop.table(margin = 2)*100
+ 
+```
+
+## limping_or_lameness
+```{r}
+limpdat <- illness3 %>%
+  filter(ill_type == "limping_or_lameness") 
+
+limpdat$which_year <- factor(limpdat$which_year, levels = c("Covid", "Pre-covid"))
+limpdat$episode <- factor(limpdat$episode, levels = c("yes", "no"))
+
+## covids limping_or_lameness INCIDENCE in comparison to the same dates on previous years, statisfied by age
+#put data into frequency table
+  strat_table6 <- table(limpdat$episode, limpdat$which_year, limpdat$age_cat)
+  
+#run adjusted chi-squared by age
+  risk_epi6 <- epi.2by2(dat = strat_table6, method = "cohort.count", 
+                       conf.level = 0.95, outcome = "as.columns")
+
+  risk_epi6
+  
+    length(limpdat$pet_ID)  
+  #Proportion tables  
+with(limpdat, table(episode, which_year))
+with(limpdat, table(episode, which_year)) %>% prop.table(margin = 2)*100
+ 
+```
+
+## Other illness
+
+```{r}
+otherdat$which_year <- factor(otherdat$which_year, levels = c("Covid", "Pre-covid"))
+otherdat$ear_problem <- factor(otherdat$ear_problem, levels = c("yes", "no"))
+otherdat$eye_problem <- factor(otherdat$eye_problem, levels = c("yes", "no"))
+otherdat$accident_or_injury <- factor(otherdat$accident_or_injury, levels = c("yes", "no"))
+otherdat$skin_problem <- factor(otherdat$skin_problem, levels = c("yes", "no"))
+```
+
+## Ear problems
+```{r}
+## covids ear problem INCIDENCE in comparison to the same dates on previous years, statisfied by age
+#put data into frequency table
+  strat_table7 <- table(otherdat$ear_problem, otherdat$which_year, otherdat$age_cat)
+  
+#run adjusted chi-squared by age
+  risk_epi7 <- epi.2by2(dat = strat_table7, method = "cohort.count", 
+                       conf.level = 0.95, outcome = "as.columns")
+
+  risk_epi7
+  
+    length(otherdat$pet_ID)  
+  #Proportion tables  
+with(otherdat, table(ear_problem, which_year))
+with(otherdat, table(ear_problem, which_year)) %>% prop.table(margin = 2)*100
+```
+  
+## Eye problems
+```{r}
+## covids eye problem INCIDENCE in comparison to the same dates on previous years, stratisfied by age
+#put data into frequency table
+  strat_table8 <- table(otherdat$eye_problem, otherdat$which_year, otherdat$age_cat)
+  
+#run adjusted chi-squared by age
+  risk_epi8 <- epi.2by2(dat = strat_table8, method = "cohort.count", 
+                       conf.level = 0.95, outcome = "as.columns")
+
+  risk_epi8
+
+    length(otherdat$pet_ID)  
+  #Proportion tables  
+with(otherdat, table(eye_problem, which_year))
+with(otherdat, table(eye_problem, which_year)) %>% prop.table(margin = 2)*100
+```
+
+## skin problems
+```{r}
+## covids skin problem INCIDENCE in comparison to the same dates on previous years, statisfied by age
+#put data into frequency table
+  strat_table9 <- table(otherdat$skin_problem, otherdat$which_year, otherdat$age_cat)
+  
+#run adjusted chi-squared by age
+  risk_epi9 <- epi.2by2(dat = strat_table9, method = "cohort.count", 
+                       conf.level = 0.95, outcome = "as.columns")
+
+  risk_epi9
+  
+      length(otherdat$pet_ID)  
+  #Proportion tables  
+with(otherdat, table(skin_problem, which_year))
+with(otherdat, table(skin_problem, which_year)) %>% prop.table(margin = 2)*100
+```
+
+## injury/accident
+```{r}
+## covids ear problem INCIDENCE in comparison to the same dates on previous years, statisfied by age
+#put data into frequency table
+  strat_table10 <- table(otherdat$accident_or_injury, otherdat$which_year, otherdat$age_cat)
+  
+#run adjusted chi-squared by age
+  risk_epi10 <- epi.2by2(dat = strat_table10, method = "cohort.count", 
+                       conf.level = 0.95, outcome = "as.columns")
+
+  risk_epi10
+
+  
+      length(otherdat$pet_ID)  
+  #Proportion tables  
+with(otherdat, table(accident_or_injury, which_year))
+with(otherdat, table(accident_or_injury, which_year)) %>% prop.table(margin = 2)*100
+```
+
+
+# did the incidence of vet visits for illnesses differ in lockdown?
+
+## Vomiting
+```{r}
+vomdat2 <- vomdat %>%
+  filter(episode == "yes") 
+
+vomdat2$vet_visit <- factor(vomdat2$vet_visit, levels = c("yes", "no"))
+vomdat2$which_year <- factor(vomdat2$which_year, levels = c("Covid", "Pre-covid"))
+
+vettab1 <- table(vomdat2$vet_visit, vomdat2$which_year, vomdat2$age_cat)
+
+#run adjusted chi-squared by age
+vetvom_epi <- epi.2by2(dat = vettab1 , method = "cohort.count", 
+                    conf.level = 0.95, outcome = "as.columns")
+
+vetvom_epi
+
+    length(vomdat2$pet_ID)  
+  #Proportion tables  
+with(vomdat2, table(vet_visit, which_year))
+with(vomdat2, table(vet_visit, which_year)) %>% prop.table(margin = 2)*100
+```
+
+## Diarrhoea
+```{r}
+diadat2 <- diadat %>%
+  filter(episode == "yes")
+
+diadat2$vet_visit <- factor(diadat2$vet_visit, levels = c("yes", "no"))
+diadat2$which_year <- factor(diadat2$which_year, levels = c("Covid", "Pre-covid"))
+
+vettab2 <- table(diadat2$vet_visit, diadat2$which_year, diadat2$age_cat)
+
+#run adjusted chi-squared by age
+vetdia_epi <- epi.2by2(dat = vettab2 , method = "cohort.count", 
+                    conf.level = 0.95, outcome = "as.columns")
+
+vetdia_epi
+
+    length(diadat2$pet_ID)  
+  #Proportion tables  
+with(diadat2, table(vet_visit, which_year))
+with(diadat2, table(vet_visit, which_year)) %>% prop.table(margin = 2)*100
+```
+
+## Coughing
+
+```{r}
+
+coughdat2 <- coughdat %>%
+  filter(episode == "yes")
+
+coughdat2$vet_visit <- factor(coughdat2$vet_visit, levels = c("yes", "no"))
+coughdat2$which_year <- factor(coughdat2$which_year, levels = c("Covid", "Pre-covid"))
+
+vettab3 <- table(coughdat2$vet_visit, coughdat2$which_year)
+
+#run adjusted chi-squared by age
+vetcough_epi <- epi.2by2(dat = vettab3 , method = "cohort.count", 
+                    conf.level = 0.95, outcome = "as.columns")
+
+vetcough_epi
+
+    length(coughdat2$pet_ID)  
+  #Proportion tables  
+with(coughdat2, table(vet_visit, which_year))
+with(coughdat2, table(vet_visit, which_year)) %>% prop.table(margin = 2)*100
+```
+
+## Scratching
+
+```{r}
+
+scratchdat2 <- scratchdat %>%
+  filter(episode == "yes")
+
+scratchdat2$vet_visit <- factor(scratchdat2$vet_visit, levels = c("yes", "no"))
+scratchdat2$which_year <- factor(scratchdat2$which_year, levels = c("Covid", "Pre-covid"))
+
+vettab4 <- table(scratchdat2$vet_visit, scratchdat2$which_year, scratchdat2$age_cat)
+
+#run adjusted chi-squared by age
+vetscratch_epi <- epi.2by2(dat = vettab4 , method = "cohort.count", 
+                    conf.level = 0.95, outcome = "as.columns")
+
+vetscratch_epi
+
+    length(scratchdat2$pet_ID)  
+  #Proportion tables  
+with(scratchdat2, table(vet_visit, which_year))
+with(scratchdat2, table(vet_visit, which_year)) %>% prop.table(margin = 2)*100
+```
+
+## Licking and chewing
+
+```{r}
+
+lickdat2 <- lickdat %>%
+  filter(episode == "yes")
+
+lickdat2$vet_visit <- factor(lickdat2$vet_visit, levels = c("yes", "no"))
+lickdat2$which_year <- factor(lickdat2$which_year, levels = c("Covid", "Pre-covid"))
+
+vettab5 <- table(lickdat2$vet_visit, lickdat2$which_year, lickdat2$age_cat)
+
+#run adjusted chi-squared by age
+vetlick_epi <- epi.2by2(dat = vettab5 , method = "cohort.count", 
+                    conf.level = 0.95, outcome = "as.columns")
+
+vetlick_epi
+
+    length(lickdat2$pet_ID)  
+  #Proportion tables  
+with(lickdat2, table(vet_visit, which_year))
+with(lickdat2, table(vet_visit, which_year)) %>% prop.table(margin = 2)*100
+```
+
+## Limping and lameness
+
+```{r}
+
+limpdat2 <- limpdat %>%
+  filter(episode == "yes")
+
+limpdat2$vet_visit <- factor(limpdat2$vet_visit, levels = c("yes", "no"))
+limpdat2$which_year <- factor(limpdat2$which_year, levels = c("Covid", "Pre-covid"))
+
+vettab6 <- table(limpdat2$vet_visit, limpdat2$which_year, limpdat2$age_cat)
+
+#run adjusted chi-squared by age
+vetlimp_epi <- epi.2by2(dat = vettab6 , method = "cohort.count", 
+                    conf.level = 0.95, outcome = "as.columns")
+
+vetlimp_epi
+
+    length(limpdat2$pet_ID)  
+  #Proportion tables  
+with(limpdat2, table(vet_visit, which_year))
+with(limpdat2, table(vet_visit, which_year)) %>% prop.table(margin = 2)*100
+```
+
+## Ear problems
+```{r}
+otherdat$which_year <- factor(otherdat$which_year, levels = c("Covid", "Pre-covid"))
+
+eardat2 <- otherdat %>%
+  filter(ear_problem == "yes")
+
+eardat2$vet_visit <- factor(eardat2$vet_visit, levels = c("yes", "no"))
+
+
+#not enough data for age categories
+vettab7 <- table(eardat2$vet_visit, eardat2$which_year, eardat2$age_cat) 
+
+#run adjusted chi-squared by age
+vetear_epi <- epi.2by2(dat = vettab7 , method = "cohort.count", 
+                    conf.level = 0.95, outcome = "as.columns")
+
+vetear_epi
+
+    length(eardat2$pet_ID)  
+  #Proportion tables  
+with(eardat2, table(vet_visit, which_year))
+with(eardat2, table(vet_visit, which_year)) %>% prop.table(margin = 2)*100
+```
+
+```{r}
+eyedat2 <- otherdat %>%
+  filter(eye_problem == "yes")
+
+eyedat2$vet_visit <- factor(eyedat2$vet_visit, levels = c("yes", "no"))
+
+
+#not enough data for age categories
+vettab8 <- table(eyedat2$vet_visit, eyedat2$which_year, eyedat2$age_cat) # not enough for age
+
+#run adjusted chi-squared by age
+veteye_epi <- epi.2by2(dat = vettab8 , method = "cohort.count", 
+                    conf.level = 0.95, outcome = "as.columns")
+
+veteye_epi
+
+    length(eyedat2$pet_ID)  
+  #Proportion tables  
+with(eyedat2, table(vet_visit, which_year))
+with(eyedat2, table(vet_visit, which_year)) %>% prop.table(margin = 2)*100
+ 
+```
+
+## skin problems
+```{r}
+skindat2 <- otherdat %>%
+  filter(skin_problem == "yes")
+
+skindat2$vet_visit <- factor(skindat2$vet_visit, levels = c("yes", "no"))
+
+#not enough data for age categories
+vettab9 <- table(skindat2$vet_visit, skindat2$which_year, skindat2$age_cat) # not enough for age
+
+#run adjusted chi-squared by age
+vetskin_epi <- epi.2by2(dat = vettab9 , method = "cohort.count", 
+                    conf.level = 0.95, outcome = "as.columns")
+
+vetskin_epi
+
+    length(skindat2$pet_ID)  
+  #Proportion tables  
+with(skindat2, table(vet_visit, which_year))
+with(skindat2, table(vet_visit, which_year)) %>% prop.table(margin = 2)*100
+```
+
+## injury problems
+```{r}
+
+injurydat2 <- otherdat %>%
+  filter(accident_or_injury == "yes")
+
+injurydat2$vet_visit <- factor(injurydat2$vet_visit, levels = c("yes", "no"))
+
+#not enough data for age categories
+vettab10 <- table(injurydat2$vet_visit, injurydat2$which_year) # not enough for age
+
+#run adjusted chi-squared by age
+vetinjury_epi <- epi.2by2(dat = vettab10 , method = "cohort.count", 
+                    conf.level = 0.95, outcome = "as.columns")
+
+vetinjury_epi
+
+     length(injurydat2$pet_ID)  
+  #Proportion tables  
+with(injurydat2, table(vet_visit, which_year))
+with(injurydat2, table(vet_visit, which_year)) %>% prop.table(margin = 2)*100
+```
+
+# MAKE FORESTPLOTS FOR PAPER
+
+## Figure 1: Forest plot of estimates from generalised additive mixed models
+
+```{r}
+results_models <- tibble(Variable = c("Exercise quantity", "Dried food quantity", "Insurance status = Yes", "Titbits status = Yes", "Sleep-person status = Yes", "Bathed SLV* = Yes", "Anti-parasitic SLV* = Yes", "Wormed SLV* = Yes", "Vaccinated SLV* = Yes"),
+                         n_ques = c(13710, 12939, 13488, 13466, 13488, 13716,13716, 13716, 13716),
+                         model_type = c("Linear", "Linear", rep("Logistic", 7)),
+                       measure = c(coef(summary(exercise_gam$mer))[3,1],
+                                   coef(summary(food_gam$mer))[3,1],
+                              exp(coef(summary(ins_gamre$mer))[3,1]),
+                              exp(coef(summary(titbits_gamre$mer))[3,1]),
+                              exp(coef(summary(sleeps_with_human_gamre$mer))[3,1]),
+                              exp(coef(summary(bathed_since_last_visit_gamre$mer))[3,1]),
+                              exp(coef(summary(anti_parasitic_since_last_visit_gamre$mer))[3,1]),
+                              exp(coef(summary(wormed_since_last_visit_gamre$mer))[3,1]),
+                              exp(coef(summary(vacc_since_last_visit_gamre$mer))[3,1])),
+                       lower = c(ci_wald(exercise_gam$mer)[3,3],
+                                 ci_wald(food_gam$mer)[3,3],
+                                 exp(ci_wald(ins_gamre$mer)[3,3]), 
+                                 exp(ci_wald(titbits_gamre$mer)[3,3]), 
+                                 exp(ci_wald(sleeps_with_human_gamre$mer)[3,3]), 
+                                 exp(ci_wald(bathed_since_last_visit_gamre$mer)[3,3]), 
+                                 exp(ci_wald(anti_parasitic_since_last_visit_gamre$mer)[3,3]), 
+                                 exp(ci_wald(wormed_since_last_visit_gamre$mer)[3,3]), 
+                                 exp(ci_wald(vacc_since_last_visit_gamre$mer)[3,3])), 
+                       upper = c(ci_wald(exercise_gam$mer)[3,4],
+                                 ci_wald(food_gam$mer)[3,4],
+                                 exp(ci_wald(ins_gamre$mer)[3,4]), 
+                                 exp(ci_wald(titbits_gamre$mer)[3,4]), 
+                                 exp(ci_wald(sleeps_with_human_gamre$mer)[3,4]), 
+                                 exp(ci_wald(bathed_since_last_visit_gamre$mer)[3,4]), 
+                                 exp(ci_wald(anti_parasitic_since_last_visit_gamre$mer)[3,4]), 
+                                 exp(ci_wald(wormed_since_last_visit_gamre$mer)[3,4]), 
+                                 exp(ci_wald(vacc_since_last_visit_gamre$mer)[3,4])), 
+                       p_value = c(p_value(exercise_gam$mer)[3,2],
+                                   p_value(food_gam$mer)[3,2],
+                              p_value(ins_gamre$mer)[3,2],
+                              p_value(titbits_gamre$mer)[3,2],
+                              p_value(sleeps_with_human_gamre$mer)[3,2],
+                              p_value(bathed_since_last_visit_gamre$mer)[3,2],
+                              p_value(anti_parasitic_since_last_visit_gamre$mer)[3,2],
+                              p_value(wormed_since_last_visit_gamre$mer)[3,2],
+                              p_value(vacc_since_last_visit_gamre$mer)[3,2])) %>%
+  mutate_at(c("measure", "lower", "upper"), ~round(., 2)) %>%
+  mutate(p_value = round(p_value, 3))
+
+models_text1 <- results_models %>%
+  mutate(p_value = as.character(p_value),
+         p_value = case_when(p_value == "0" ~ "<0.001",
+                             p_value == "0.01" ~ "0.010",
+                              p_value == "0.99" ~ "0.990",
+                             TRUE ~ p_value)) %>%
+  mutate_at(vars(measure, lower, upper), ~ sprintf("%.2f", .))
+
+
+models_text_labels <- tibble(Variable = c("Variable", NA, NA),
+                             n_ques = c("N", NA, NA),
+                             model_type = c("Model type", NA, NA),
+                               measure = c("Measure", "Beta coefficient", "Odds ratio"),
+                               lower = c("Lower 95% CI", NA, NA),
+                               upper = c("Upper 95% CI", NA, NA),
+                               p_value = c("P-value", NA, NA))
+
+models_text <- rbind(models_text_labels, models_text1) %>%
+  mutate(sorter = c(1, 2, 5, 3, 4, 6:12)) %>%
+  arrange(sorter) %>%
+  select(-sorter)
+
+models_nums <- results_models %>%
+  select(measure,lower,upper) 
+
+
+NA_labels <- tibble(measure = c(NA, NA, NA), 
+                    lower =c(NA, NA, NA), 
+                    upper =c(NA, NA, NA))
+
+models_nums <- rbind(NA_labels, models_nums) %>%
+  mutate(sorter = c(1, 2, 5, 3, 4, 6:12)) %>%
+  arrange(sorter) %>%
+  select(-sorter)
+
+#Plot and save the forestplot
+fplot1 <- forestplot(models_text,
+                     models_nums$measure,
+                     models_nums$lower,
+                     models_nums$upper,
+                     align = "c",
+                     boxsize = 0.2,
+                     new_page = TRUE,
+                     colgap = unit(5, "mm"),
+                     is.summary = c(TRUE, rep(FALSE, 13)),
+                     lwd.ci=1.8,
+                     lwd.zero = 1.8,
+                     ci.vertices = TRUE,
+                     zero = 1,
+                     graph.pos = 5,
+                     graphwidth = unit(10, "cm"),
+                     clip = c(-2,8),
+                     txt_gp=fpTxtGp(label=gpar(cex=1.3),
+                                    ticks=gpar(cex=1.3),
+                                    xlab=gpar(cex=1.3)),
+                     hrzl_lines = list("2" = gpar(col="#444444"),
+                                       "13" = gpar(col="#444444")),
+                     col = fpColors(lines="blue", box="darkblue", zero = "red"))
+fplot1
+
+tiff("models_forestplot_f.tiff", units="mm", width=400, height=200, res=300)
+fplot1
+dev.off()
+```
+
+## Figure 2: Forest plot of estimates from chi-squared tests 
+
+```{r}
+results_all <- tibble(Type = c("Any illness", "Vomiting", "Diarrhoea", "Coughing", "Scratching", "Licking or chewing", "Limping or lameness", "Ear problems", "Eye problems", "Skin problems", "Accident or injury",
+                               rep(NA_character_, 11)),
+                      Variable = c(rep("Illness incidence", 11),rep("VA incidence", 3), "VA incidence*", rep("VA incidence", 6), "VA incidence*"),
+                      sorter = rep(1:11, 2),
+                          OR = c(risk_epi$massoc.summary[5,2],risk_epi1$massoc.summary[5,2],risk_epi2$massoc.summary[5,2],risk_epi3$massoc.summary[5,2],risk_epi4$massoc.summary[5,2],risk_epi5$massoc.summary[5,2],risk_epi6$massoc.summary[5,2],risk_epi7$massoc.summary[5,2],risk_epi8$massoc.summary[5,2],risk_epi9$massoc.summary[5,2],risk_epi10$massoc.summary[5,2],
+                                 vetill_epi$massoc.summary[5,2],vetvom_epi$massoc.summary[5,2],vetdia_epi$massoc.summary[5,2],vetcough_epi$massoc.summary[2,2],vetscratch_epi$massoc.summary[5,2],vetlick_epi$massoc.summary[5,2], vetlimp_epi$massoc.summary[5,2],vetear_epi$massoc.summary[5,2], veteye_epi$massoc.summary[5,2],vetskin_epi$massoc.summary[5,2], vetinjury_epi$massoc.summary[2,2]),
+                          lower = c(risk_epi$massoc.summary[5,3],risk_epi1$massoc.summary[5,3],risk_epi2$massoc.summary[5,3],risk_epi3$massoc.summary[5,3],risk_epi4$massoc.summary[5,3],risk_epi5$massoc.summary[5,3],risk_epi6$massoc.summary[5,3],risk_epi7$massoc.summary[5,3],risk_epi8$massoc.summary[5,3],risk_epi9$massoc.summary[5,3],risk_epi10$massoc.summary[5,3],
+                                    vetill_epi$massoc.summary[5,3], vetvom_epi$massoc.summary[5,3],vetdia_epi$massoc.summary[5,3],vetcough_epi$massoc.summary[2,3],vetscratch_epi$massoc.summary[5,3],vetlick_epi$massoc.summary[5,3],vetlimp_epi$massoc.summary[5,3],vetear_epi$massoc.summary[5,3], veteye_epi$massoc.summary[5,3], vetskin_epi$massoc.summary[5,3], vetinjury_epi$massoc.summary[2,3]),
+                          upper = c(risk_epi$massoc.summary[5,4],risk_epi1$massoc.summary[5,4],risk_epi2$massoc.summary[5,4],risk_epi3$massoc.summary[5,4],risk_epi4$massoc.summary[5,4],risk_epi5$massoc.summary[5,4],risk_epi6$massoc.summary[5,4],risk_epi7$massoc.summary[5,4],risk_epi8$massoc.summary[5,4],risk_epi9$massoc.summary[5,4],risk_epi10$massoc.summary[5,4],
+                                    vetill_epi$massoc.summary[5,4],vetvom_epi$massoc.summary[5,4],vetdia_epi$massoc.summary[5,4],vetcough_epi$massoc.summary[2,4],vetscratch_epi$massoc.summary[5,4],vetlick_epi$massoc.summary[5,4],vetlimp_epi$massoc.summary[5,4],vetear_epi$massoc.summary[5,4], veteye_epi$massoc.summary[5,4], vetskin_epi$massoc.summary[5,4], vetinjury_epi$massoc.summary[2,4]),
+                          p_value = unlist(c(risk_epi$massoc.detail$chi2.mh[4], risk_epi1$massoc.detail$chi2.mh[4], risk_epi2$massoc.detail$chi2.mh[4], risk_epi3$massoc.detail$chi2.mh[4], risk_epi4$massoc.detail$chi2.mh[4], risk_epi5$massoc.detail$chi2.mh[4], risk_epi6$massoc.detail$chi2.mh[4], risk_epi7$massoc.detail$chi2.mh[4], risk_epi8$massoc.detail$chi2.mh[4],risk_epi9$massoc.detail$chi2.mh[4], risk_epi10$massoc.detail$chi2.mh[4],
+                                             vetill_epi$massoc.detail$chi2.mh[4],vetvom_epi$massoc.detail$chi2.mh[4],vetdia_epi$massoc.detail$chi2.mh[4],vetcough_epi$massoc.detail$chi2.strata.uncor[4],vetscratch_epi$massoc.detail$chi2.mh[4],vetlick_epi$massoc.detail$chi2.mh[4],vetlimp_epi$massoc.detail$chi2.mh[4],vetear_epi$massoc.detail$chi2.mh[4],veteye_epi$massoc.detail$chi2.mh[4],vetskin_epi$massoc.detail$chi2.mh[4], vetinjury_epi$massoc.detail$chi2.strata.uncor[4]))) %>%
+  mutate_at(c("OR", "lower", "upper"), ~round(., 2)) %>%
+  mutate(p_value = round(p_value, 3)) %>%
+  arrange(sorter)
+
+
+cat1 <- tibble(Type2 = c("Any illness", "Vomiting", "Diarrhoea", "Coughing", "Scratching", "Licking or chewing", "Limping or lameness", "Ear problems", "Eye problems", "Skin problems", "Accident or injury",
+                             "Any illness", "Vomiting", "Diarrhoea", "Coughing*", "Scratching", "Licking or chewing", "Limping or lameness", "Ear problems", "Eye problems", "Skin problems", "Accident or injury*"),
+               sorter = rep(1:11, 2)) %>%
+  arrange(sorter) %>%
+  mutate(Type = results_all$Type, 
+         Variable = results_all$Variable) 
+
+results_all2 <- full_join(results_all, cat1)
+
+results_text <- results_all2 %>%
+  mutate(p_value = as.character(p_value),
+         p_value = case_when(p_value == "0.14" ~ "0.140",
+                             p_value == "0.55" ~ "0.550",
+                             p_value == "0.59" ~ "0.590",
+                             p_value == "0.89" ~ "0.890",
+                             p_value == "0" ~ "0.000",
+                             TRUE ~ p_value)) %>%
+  mutate_at(vars(OR, lower, upper), ~ sprintf("%.2f", .)) %>%
+  select(Illness_type = Type, Variable = Variable, OR, lower, upper, p_value)
+
+results_text_labels <- tibble(Illness_type = "Illness type",
+                              Variable = c("Variable"),
+                              OR = c("Odds ratio"),
+                              lower = c("Lower 95% CI"),
+                              upper = c("Upper 95% CI"),
+                              p_value = "P-value")
+
+results_text <- rbind(results_text_labels, results_text)
+
+results_nums <- results_all2 %>%
+  select(OR, lower, upper) %>%
+  mutate_all(as.numeric)
+
+NA_labels <- tibble(OR = c(NA),
+                    lower = c(NA),
+                    upper = c(NA))
+
+results_nums <- rbind(NA_labels, results_nums)
+
+#Plot and save the forestplot
+fplot2 <- forestplot(results_text,
+                     results_nums$OR,
+                     results_nums$lower,
+                     results_nums$upper,
+                     align = "c",
+                     boxsize = 0.2,
+                     new_page = TRUE,
+                     colgap = unit(5, "mm"),
+                     is.summary = c(TRUE, rep(FALSE, 22)),
+                     lwd.ci=1.8,
+                     lwd.zero = 1.8,
+                     ci.vertices = TRUE,
+                     zero = 1,
+                     graph.pos = 4,
+                     clip = c(0,4),
+                     graphwidth = unit(10, "cm"),
+                     txt_gp=fpTxtGp(label=gpar(cex=1.3),
+                                    ticks=gpar(cex=1.3),
+                                    xlab=gpar(cex=1.3)),
+                     hrzl_lines = list("2" = gpar(col="#444444"),
+                                       "24" = gpar(col="#444444")),
+                     col = fpColors(lines="blue", box="darkblue", zero = "red"))
+fplot2
+tiff("joined_forestplot_f.tiff", units="mm", width=360, height=400, res=130)
+fplot2
+dev.off()
+```
+
